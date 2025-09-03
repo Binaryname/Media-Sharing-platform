@@ -1,0 +1,465 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Core Media Sharing Platform - EC2 backend, S3 storage, CloudFront, Lambda auto-tagger, VPC, IAM (minimal, free-tier friendly)
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: media-platform
+    Description: Project prefix used in resource names
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 KeyPair in this region (required for SSH)
+  InstanceType:
+    Type: String
+    Default: t2.micro
+    AllowedValues: [t2.micro, t3.micro, t3a.micro, t3.small]
+    Description: EC2 instance type (t2.micro is free-tier eligible)
+  AdminUsername:
+    Type: String
+    Default: admin
+  AdminPassword:
+    Type: String
+    NoEcho: true
+    Description: Admin password (NoEcho hides it in console)
+  ViewerUsername:
+    Type: String
+    Default: viewer
+  ViewerPassword:
+    Type: String
+    NoEcho: true
+    Description: Viewer password (NoEcho hides it in console)
+
+Resources:
+
+  ## -------------------------
+  ## Networking
+  ## -------------------------
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.42.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-vpc'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties: {}
+
+  AttachIgw:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.42.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-a'
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  RtAssocPublic:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  ## -------------------------
+  ## Security Groups
+  ## -------------------------
+  Ec2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH(22), HTTP(80) and App(5000) for backend (adjust for production)
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0    # <--- restrict to your IP in prod
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 5000
+          ToPort: 5000
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          FromPort: 0
+          ToPort: 0
+          CidrIp: 0.0.0.0/0
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Lambda outbound egress SG
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          FromPort: 0
+          ToPort: 0
+          CidrIp: 0.0.0.0/0
+
+  ## -------------------------
+  ## S3 bucket + CloudFront
+  ## -------------------------
+  MediaBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::AccountId}-${ProjectName}-media'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-uploads
+            Prefix: uploads/
+            Status: Enabled
+            ExpirationInDays: 14
+
+  CloudFrontOAI:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: !Sub 'OAI for ${ProjectName}'
+
+  MediaBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref MediaBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontGet
+            Effect: Allow
+            Principal:
+              CanonicalUser: !GetAtt CloudFrontOAI.S3CanonicalUserId
+            Action: 's3:GetObject'
+            Resource: !Sub '${MediaBucket.Arn}/*'
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt MediaBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub 'origin-access-identity/cloudfront/${CloudFrontOAI}'
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+          ForwardedValues:
+            QueryString: true
+            Cookies: { Forward: none }
+        PriceClass: PriceClass_100
+
+  ## -------------------------
+  ## IAM Roles
+  ## -------------------------
+  Ec2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: MediaS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !GetAtt MediaBucket.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:PutObjectTagging
+                  - s3:GetObjectTagging
+                Resource: !Sub '${MediaBucket.Arn}/*'
+        - PolicyName: EC2Logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+
+  Ec2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref Ec2Role
+      Path: "/"
+
+  TaggerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: LambdaS3Index
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:PutObjectTagging
+                Resource: !Sub '${MediaBucket.Arn}/*'
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt MediaBucket.Arn
+        - PolicyName: LambdaLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+
+  ## -------------------------
+  ## Lambda auto-tagger (simple content-type based)
+  ## -------------------------
+  TaggerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt TaggerLambdaRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref MediaBucket
+      Code:
+        ZipFile: |
+          import json, os, boto3, urllib.parse
+          s3 = boto3.client('s3')
+          def handler(event, context):
+              bucket = os.environ.get('BUCKET_NAME')
+              results = []
+              for r in event.get('Records', []):
+                  key = urllib.parse.unquote(r['s3']['object']['key'])
+                  # only tag uploads/
+                  if not key.startswith('uploads/'):
+                      continue
+                  # get content type
+                  try:
+                      head = s3.head_object(Bucket=bucket, Key=key)
+                      ctype = head.get('ContentType','application/octet-stream')
+                  except Exception as e:
+                      ctype = 'application/octet-stream'
+                  labels = []
+                  if ctype.startswith('image/'):
+                      labels.append('image')
+                  elif ctype.startswith('video/'):
+                      labels.append('video')
+                  else:
+                      labels.append('file')
+                  # write tags
+                  tagset = [{'Key': f'label{i+1}', 'Value': v} for i,v in enumerate(labels[:10])]
+                  s3.put_object_tagging(Bucket=bucket, Key=key, Tagging={'TagSet': tagset})
+                  # write index json
+                  idx_key = f'index/{key.replace("/","__")}.json'
+                  s3.put_object(Bucket=bucket, Key=idx_key, Body=json.dumps({'key': key,'labels': labels}), ContentType='application/json')
+                  results.append({'key': key, 'labels': labels})
+              return {'tagged': results}
+
+  S3InvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TaggerFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub '${MediaBucket.Arn}'
+
+  ## Add notification AFTER Lambda permission exists (ensures proper ordering)
+  MediaBucketNotification:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref MediaBucket
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:Put
+            Function: !GetAtt TaggerFunction.Arn
+    DependsOn: S3InvokePermission
+
+  ## -------------------------
+  ## EC2 Instance + UserData (Flask backend)
+  ## -------------------------
+  EC2LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ec2/${ProjectName}'
+      RetentionInDays: 7
+
+  LatestAl2023Ami:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Properties:
+      Name: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestAl2023Ami
+      KeyName: !Ref KeyName
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref Ec2SecurityGroup
+      IamInstanceProfile: !Ref Ec2InstanceProfile
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ec2'
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          yum -y update
+          yum -y install python3 python3-pip
+          mkdir -p /opt/app
+          cat > /opt/app/app.py <<'PY'
+          import os, json, io
+          from flask import Flask, request, jsonify
+          from functools import wraps
+          import boto3, requests
+          s3 = boto3.client('s3')
+          ADMIN_U = os.environ.get('ADMIN_U','admin')
+          ADMIN_P = os.environ.get('ADMIN_P','ChangeMe123!')
+          VIEW_U = os.environ.get('VIEW_U','viewer')
+          VIEW_P = os.environ.get('VIEW_P','ChangeMe123!')
+          BUCKET = os.environ.get('BUCKET')
+          app = Flask(__name__)
+          def role_required(role):
+              def deco(f):
+                  @wraps(f)
+                  def inner(*a, **kw):
+                      auth = request.authorization
+                      if not auth:
+                          return jsonify({'error':'auth required'}),401
+                      u,p = auth.username, auth.password
+                      if role=='any' and (u,p) in [(ADMIN_U,ADMIN_P),(VIEW_U,VIEW_P)]:
+                          return f(*a, **kw)
+                      if role=='admin' and (u,p)==(ADMIN_U,ADMIN_P):
+                          return f(*a, **kw)
+                      return jsonify({'error':'forbidden'}),403
+                  return inner
+              return deco
+          @app.after_request
+          def cors(resp):
+              resp.headers['Access-Control-Allow-Origin']='*'
+              resp.headers['Access-Control-Allow-Headers']='Authorization,Content-Type'
+              resp.headers['Access-Control-Allow-Methods']='GET,POST,DELETE,OPTIONS'
+              return resp
+          @app.route('/health')
+          def health(): return {'ok':True}
+          @app.route('/get-upload-url', methods=['POST'])
+          @role_required('admin')
+          def get_upload_url():
+              data = request.get_json(force=True)
+              filename = data.get('filename')
+              key = f'uploads/{filename}'
+              url = s3.generate_presigned_url('put_object', Params={'Bucket': BUCKET, 'Key': key}, ExpiresIn=300)
+              return jsonify({'key': key, 'url': url})
+          @app.route('/get-download-url')
+          @role_required('any')
+          def get_download_url():
+              key = request.args.get('key')
+              url = s3.generate_presigned_url('get_object', Params={'Bucket': BUCKET, 'Key': key}, ExpiresIn=300)
+              return jsonify({'url': url})
+          @app.route('/list')
+          @role_required('any')
+          def list_objects():
+              prefix = request.args.get('prefix','uploads/')
+              tag = request.args.get('tag')
+              objs = s3.list_objects_v2(Bucket=BUCKET, Prefix=prefix).get('Contents',[])
+              out=[]
+              for o in objs:
+                  k=o['Key']
+                  if k.endswith('/'): continue
+                  tags = s3.get_object_tagging(Bucket=BUCKET, Key=k).get('TagSet',[])
+                  labels=[t['Value'] for t in tags if t['Key'].startswith('label')]
+                  if (not tag) or (tag in labels):
+                      out.append({'key':k,'size':o['Size'],'labels':labels})
+              return jsonify(out)
+          @app.route('/delete', methods=['DELETE'])
+          @role_required('admin')
+          def delete():
+              key = request.args.get('key')
+              s3.delete_object(Bucket=BUCKET, Key=key)
+              return jsonify({'deleted': key})
+          if __name__ == '__main__':
+              app.run(host='0.0.0.0', port=5000)
+          PY
+          pip3 install --no-cache-dir flask boto3 requests
+          cat > /etc/profile.d/appenv.sh <<ENV
+          export ADMIN_U='${AdminUsername}'
+          export ADMIN_P='${AdminPassword}'
+          export VIEW_U='${ViewerUsername}'
+          export VIEW_P='${ViewerPassword}'
+          export BUCKET='${MediaBucket}'
+          ENV
+          source /etc/profile.d/appenv.sh
+          nohup python3 /opt/app/app.py > /opt/app/app.log 2>&1 &
+
+Outputs:
+  BucketName:
+    Description: S3 bucket name to upload frontend & media
+    Value: !Ref MediaBucket
+  CloudFrontURL:
+    Description: CDN URL (use this to deliver static site)
+    Value: !Sub 'https://${Distribution.DomainName}'
+  EC2PublicDNS:
+    Description: Backend API DNS (Flask runs on port 5000)
+    Value: !GetAtt EC2Instance.PublicDnsName
+  BackendAPI:
+    Description: Example: http://EC2_PUBLIC_DNS:5000
+    Value: !Sub 'http://${EC2Instance.PublicDnsName}:5000'
